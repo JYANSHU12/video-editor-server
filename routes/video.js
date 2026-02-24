@@ -11,7 +11,64 @@ const router = express.Router();
 const UPLOADS_DIR = path.join(__dirname, '..', 'uploads');
 const PROCESSED_DIR = path.join(__dirname, '..', 'processed');
 
-// Multer config
+// ─── Job Queue: max 1 concurrent FFmpeg job ───
+let activeJobs = 0;
+const MAX_CONCURRENT_JOBS = 1;
+const jobQueue = [];
+
+function enqueueJob(jobFn) {
+    return new Promise((resolve, reject) => {
+        const run = () => {
+            activeJobs++;
+            console.log(`⚙️ Job started (active: ${activeJobs})`);
+            jobFn()
+                .then(resolve)
+                .catch(reject)
+                .finally(() => {
+                    activeJobs--;
+                    console.log(`⚙️ Job finished (active: ${activeJobs}, queued: ${jobQueue.length})`);
+                    if (jobQueue.length > 0) {
+                        const next = jobQueue.shift();
+                        next();
+                    }
+                });
+        };
+
+        if (activeJobs < MAX_CONCURRENT_JOBS) {
+            run();
+        } else {
+            console.log(`⏳ Job queued (queue size: ${jobQueue.length + 1})`);
+            jobQueue.push(run);
+        }
+    });
+}
+
+// Helper: safely delete a file
+function safeDelete(filePath) {
+    try {
+        if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+    } catch (e) { /* ignore */ }
+}
+
+// Memory-optimized FFmpeg output options
+const FFMPEG_OUTPUT_OPTS = [
+    '-c:v', 'libx264',
+    '-c:a', 'aac',
+    '-preset', 'ultrafast',   // minimal RAM usage
+    '-crf', '28',             // lower quality = less memory
+    '-threads', '1',          // single thread to cap buffer memory
+    '-movflags', '+faststart'
+];
+
+const FFMPEG_VIDEO_ONLY_OPTS = [
+    '-c:v', 'libx264',
+    '-preset', 'ultrafast',
+    '-crf', '28',
+    '-threads', '1',
+    '-movflags', '+faststart'
+];
+
+// Multer config — reduced limits for free-tier hosting
 const storage = multer.diskStorage({
     destination: (req, file, cb) => cb(null, UPLOADS_DIR),
     filename: (req, file, cb) => {
@@ -21,7 +78,7 @@ const storage = multer.diskStorage({
 });
 const upload = multer({
     storage,
-    limits: { fileSize: 500 * 1024 * 1024 },
+    limits: { fileSize: 50 * 1024 * 1024 }, // 50 MB max (was 500 MB)
     fileFilter: (req, file, cb) => {
         const allowed = /video|audio/;
         if (allowed.test(file.mimetype)) {
@@ -32,14 +89,17 @@ const upload = multer({
     }
 });
 
-// Helper: find a system font that works on Windows
+// Helper: find a system font (Linux for Render, Windows for local dev)
 function getSystemFont() {
     const candidates = [
+        // Linux (Render)
+        '/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf',
+        '/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf',
+        '/usr/share/fonts/truetype/freefont/FreeSans.ttf',
+        // Windows (local dev)
         'C:/Windows/Fonts/arial.ttf',
         'C:/Windows/Fonts/segoeui.ttf',
         'C:/Windows/Fonts/tahoma.ttf',
-        'C:/Windows/Fonts/verdana.ttf',
-        'C:/Windows/Fonts/calibri.ttf',
     ];
     for (const f of candidates) {
         if (fs.existsSync(f)) return f.replace(/\\/g, '/').replace(/:/g, '\\\\:');
@@ -83,7 +143,7 @@ router.post('/upload', upload.single('video'), (req, res) => {
 });
 
 // ─── Upload Multiple Videos (for merge) ───
-router.post('/upload-multiple', upload.array('videos', 10), (req, res) => {
+router.post('/upload-multiple', upload.array('videos', 3), (req, res) => { // max 3 files (was 10)
     if (!req.files || req.files.length === 0) {
         return res.status(400).json({ error: 'No files uploaded' });
     }
@@ -178,27 +238,31 @@ router.post('/trim', (req, res) => {
 
     console.log(`✂️ Trimming: ${filename} from ${startTime}s to ${endTime}s`);
 
-    const cmd = ffmpeg(inputPath)
-        .setStartTime(startTime || 0)
-        .outputOptions(['-c:v', 'libx264', '-c:a', 'aac', '-preset', 'fast', '-movflags', '+faststart']);
+    enqueueJob(() => new Promise((resolve, reject) => {
+        const cmd = ffmpeg(inputPath)
+            .setStartTime(startTime || 0)
+            .outputOptions(FFMPEG_OUTPUT_OPTS);
 
-    if (endTime) {
-        cmd.setDuration(endTime - (startTime || 0));
-    }
+        if (endTime) {
+            cmd.setDuration(endTime - (startTime || 0));
+        }
 
-    cmd.output(outputPath)
-        .on('progress', (progress) => {
-            if (progress.percent) console.log(`  ✂️ Trim progress: ${Math.round(progress.percent)}%`);
-        })
-        .on('end', () => {
-            console.log(`  ✂️ Trim complete: ${outputFilename}`);
-            res.json({ success: true, filename: outputFilename, message: 'Video trimmed successfully' });
-        })
-        .on('error', (err) => {
-            console.error('Trim error:', err.message);
-            res.status(500).json({ error: 'Failed to trim video', details: err.message });
-        })
-        .run();
+        cmd.output(outputPath)
+            .on('progress', (progress) => {
+                if (progress.percent) console.log(`  ✂️ Trim progress: ${Math.round(progress.percent)}%`);
+            })
+            .on('end', () => {
+                console.log(`  ✂️ Trim complete: ${outputFilename}`);
+                res.json({ success: true, filename: outputFilename, message: 'Video trimmed successfully' });
+                resolve();
+            })
+            .on('error', (err) => {
+                console.error('Trim error:', err.message);
+                if (!res.headersSent) res.status(500).json({ error: 'Failed to trim video', details: err.message });
+                resolve(); // resolve even on FFmpeg error so queue continues
+            })
+            .run();
+    }));
 });
 
 // ─── Apply Filter ───
@@ -234,22 +298,26 @@ router.post('/filter', (req, res) => {
 
     console.log(`🎨 Applying filter '${filter}' to: ${filename}`);
 
-    ffmpeg(inputPath)
-        .videoFilters(videoFilter)
-        .outputOptions(['-c:v', 'libx264', '-c:a', 'aac', '-preset', 'fast', '-movflags', '+faststart'])
-        .output(outputPath)
-        .on('progress', (progress) => {
-            if (progress.percent) console.log(`  🎨 Filter progress: ${Math.round(progress.percent)}%`);
-        })
-        .on('end', () => {
-            console.log(`  🎨 Filter complete: ${outputFilename}`);
-            res.json({ success: true, filename: outputFilename, message: `Filter '${filter}' applied successfully` });
-        })
-        .on('error', (err) => {
-            console.error('Filter error:', err.message);
-            res.status(500).json({ error: 'Failed to apply filter', details: err.message });
-        })
-        .run();
+    enqueueJob(() => new Promise((resolve) => {
+        ffmpeg(inputPath)
+            .videoFilters(videoFilter)
+            .outputOptions(FFMPEG_OUTPUT_OPTS)
+            .output(outputPath)
+            .on('progress', (progress) => {
+                if (progress.percent) console.log(`  🎨 Filter progress: ${Math.round(progress.percent)}%`);
+            })
+            .on('end', () => {
+                console.log(`  🎨 Filter complete: ${outputFilename}`);
+                res.json({ success: true, filename: outputFilename, message: `Filter '${filter}' applied successfully` });
+                resolve();
+            })
+            .on('error', (err) => {
+                console.error('Filter error:', err.message);
+                if (!res.headersSent) res.status(500).json({ error: 'Failed to apply filter', details: err.message });
+                resolve();
+            })
+            .run();
+    }));
 });
 
 // ─── Add Text Overlay ───
@@ -291,22 +359,26 @@ router.post('/text', (req, res) => {
 
     console.log(`🔤 Adding text '${text}' to: ${filename}`);
 
-    ffmpeg(inputPath)
-        .videoFilters(drawTextFilter)
-        .outputOptions(['-c:v', 'libx264', '-c:a', 'aac', '-preset', 'fast', '-movflags', '+faststart'])
-        .output(outputPath)
-        .on('progress', (progress) => {
-            if (progress.percent) console.log(`  🔤 Text progress: ${Math.round(progress.percent)}%`);
-        })
-        .on('end', () => {
-            console.log(`  🔤 Text complete: ${outputFilename}`);
-            res.json({ success: true, filename: outputFilename, message: 'Text overlay added successfully' });
-        })
-        .on('error', (err) => {
-            console.error('Text error:', err.message);
-            res.status(500).json({ error: 'Failed to add text', details: err.message });
-        })
-        .run();
+    enqueueJob(() => new Promise((resolve) => {
+        ffmpeg(inputPath)
+            .videoFilters(drawTextFilter)
+            .outputOptions(FFMPEG_OUTPUT_OPTS)
+            .output(outputPath)
+            .on('progress', (progress) => {
+                if (progress.percent) console.log(`  🔤 Text progress: ${Math.round(progress.percent)}%`);
+            })
+            .on('end', () => {
+                console.log(`  🔤 Text complete: ${outputFilename}`);
+                res.json({ success: true, filename: outputFilename, message: 'Text overlay added successfully' });
+                resolve();
+            })
+            .on('error', (err) => {
+                console.error('Text error:', err.message);
+                if (!res.headersSent) res.status(500).json({ error: 'Failed to add text', details: err.message });
+                resolve();
+            })
+            .run();
+    }));
 });
 
 // ─── Merge Videos ───
@@ -338,26 +410,29 @@ router.post('/merge', (req, res) => {
 
     console.log(`🔗 Merging ${filenames.length} videos`);
 
-    ffmpeg()
-        .input(listFilePath)
-        .inputOptions(['-f', 'concat', '-safe', '0'])
-        .outputOptions(['-c:v', 'libx264', '-c:a', 'aac', '-preset', 'fast', '-movflags', '+faststart'])
-        .output(outputPath)
-        .on('progress', (progress) => {
-            if (progress.percent) console.log(`  🔗 Merge progress: ${Math.round(progress.percent)}%`);
-        })
-        .on('end', () => {
-            // Clean up list file
-            try { if (fs.existsSync(listFilePath)) fs.unlinkSync(listFilePath); } catch (e) { /* ignore */ }
-            console.log(`  🔗 Merge complete: ${outputFilename}`);
-            res.json({ success: true, filename: outputFilename, message: 'Videos merged successfully' });
-        })
-        .on('error', (err) => {
-            console.error('Merge error:', err.message);
-            try { if (fs.existsSync(listFilePath)) fs.unlinkSync(listFilePath); } catch (e) { /* ignore */ }
-            res.status(500).json({ error: 'Failed to merge videos', details: err.message });
-        })
-        .run();
+    enqueueJob(() => new Promise((resolve) => {
+        ffmpeg()
+            .input(listFilePath)
+            .inputOptions(['-f', 'concat', '-safe', '0'])
+            .outputOptions(FFMPEG_OUTPUT_OPTS)
+            .output(outputPath)
+            .on('progress', (progress) => {
+                if (progress.percent) console.log(`  🔗 Merge progress: ${Math.round(progress.percent)}%`);
+            })
+            .on('end', () => {
+                safeDelete(listFilePath);
+                console.log(`  🔗 Merge complete: ${outputFilename}`);
+                res.json({ success: true, filename: outputFilename, message: 'Videos merged successfully' });
+                resolve();
+            })
+            .on('error', (err) => {
+                console.error('Merge error:', err.message);
+                safeDelete(listFilePath);
+                if (!res.headersSent) res.status(500).json({ error: 'Failed to merge videos', details: err.message });
+                resolve();
+            })
+            .run();
+    }));
 });
 
 // ─── Audio Operations ───
@@ -377,23 +452,28 @@ router.post('/audio', (req, res) => {
     if (operation === 'extract') {
         const audioFilename = `audio_${uuidv4()}.mp3`;
         const audioPath = path.join(PROCESSED_DIR, audioFilename);
-        ffmpeg(inputPath)
-            .noVideo()
-            .audioCodec('libmp3lame')
-            .audioBitrate('192k')
-            .output(audioPath)
-            .on('progress', (progress) => {
-                if (progress.percent) console.log(`  🎵 Extract progress: ${Math.round(progress.percent)}%`);
-            })
-            .on('end', () => {
-                console.log(`  🎵 Audio extracted: ${audioFilename}`);
-                res.json({ success: true, filename: audioFilename, message: 'Audio extracted successfully' });
-            })
-            .on('error', (err) => {
-                console.error('Audio extract error:', err.message);
-                res.status(500).json({ error: 'Failed to extract audio', details: err.message });
-            })
-            .run();
+
+        enqueueJob(() => new Promise((resolve) => {
+            ffmpeg(inputPath)
+                .noVideo()
+                .audioCodec('libmp3lame')
+                .audioBitrate('128k') // reduced from 192k
+                .output(audioPath)
+                .on('progress', (progress) => {
+                    if (progress.percent) console.log(`  🎵 Extract progress: ${Math.round(progress.percent)}%`);
+                })
+                .on('end', () => {
+                    console.log(`  🎵 Audio extracted: ${audioFilename}`);
+                    res.json({ success: true, filename: audioFilename, message: 'Audio extracted successfully' });
+                    resolve();
+                })
+                .on('error', (err) => {
+                    console.error('Audio extract error:', err.message);
+                    if (!res.headersSent) res.status(500).json({ error: 'Failed to extract audio', details: err.message });
+                    resolve();
+                })
+                .run();
+        }));
         return;
     }
 
@@ -405,22 +485,26 @@ router.post('/audio', (req, res) => {
             const duration = (metadata && metadata.format && metadata.format.duration) ? parseFloat(metadata.format.duration) : 30;
             const fadeStart = Math.max(0, duration - 3);
 
-            ffmpeg(inputPath)
-                .audioFilters(`afade=t=out:st=${fadeStart}:d=3`)
-                .outputOptions(['-c:v', 'libx264', '-preset', 'fast', '-movflags', '+faststart'])
-                .output(outputPath)
-                .on('progress', (progress) => {
-                    if (progress.percent) console.log(`  📉 FadeOut progress: ${Math.round(progress.percent)}%`);
-                })
-                .on('end', () => {
-                    console.log(`  📉 FadeOut complete: ${outputFilename}`);
-                    res.json({ success: true, filename: outputFilename, message: `Audio operation 'fadeOut' completed` });
-                })
-                .on('error', (err) => {
-                    console.error('Audio fadeOut error:', err.message);
-                    res.status(500).json({ error: 'Failed to process audio', details: err.message });
-                })
-                .run();
+            enqueueJob(() => new Promise((resolve) => {
+                ffmpeg(inputPath)
+                    .audioFilters(`afade=t=out:st=${fadeStart}:d=3`)
+                    .outputOptions(FFMPEG_VIDEO_ONLY_OPTS)
+                    .output(outputPath)
+                    .on('progress', (progress) => {
+                        if (progress.percent) console.log(`  📉 FadeOut progress: ${Math.round(progress.percent)}%`);
+                    })
+                    .on('end', () => {
+                        console.log(`  📉 FadeOut complete: ${outputFilename}`);
+                        res.json({ success: true, filename: outputFilename, message: `Audio operation 'fadeOut' completed` });
+                        resolve();
+                    })
+                    .on('error', (err) => {
+                        console.error('Audio fadeOut error:', err.message);
+                        if (!res.headersSent) res.status(500).json({ error: 'Failed to process audio', details: err.message });
+                        resolve();
+                    })
+                    .run();
+            }));
         });
         return;
     }
@@ -444,24 +528,27 @@ router.post('/audio', (req, res) => {
             return res.status(400).json({ error: `Unknown audio operation: ${operation}` });
     }
 
-    cmd.outputOptions(['-c:v', 'libx264', '-preset', 'fast', '-movflags', '+faststart'])
-        .output(outputPath)
-        .on('progress', (progress) => {
-            if (progress.percent) console.log(`  🔊 Audio progress: ${Math.round(progress.percent)}%`);
-        })
-        .on('end', () => {
-            console.log(`  🔊 Audio '${operation}' complete: ${outputFilename}`);
-            res.json({ success: true, filename: outputFilename, message: `Audio operation '${operation}' completed` });
-        })
-        .on('error', (err) => {
-            console.error('Audio error:', err.message);
-            res.status(500).json({ error: 'Failed to process audio', details: err.message });
-        })
-        .run();
+    enqueueJob(() => new Promise((resolve) => {
+        cmd.outputOptions(FFMPEG_VIDEO_ONLY_OPTS)
+            .output(outputPath)
+            .on('progress', (progress) => {
+                if (progress.percent) console.log(`  🔊 Audio progress: ${Math.round(progress.percent)}%`);
+            })
+            .on('end', () => {
+                console.log(`  🔊 Audio '${operation}' complete: ${outputFilename}`);
+                res.json({ success: true, filename: outputFilename, message: `Audio operation '${operation}' completed` });
+                resolve();
+            })
+            .on('error', (err) => {
+                console.error('Audio error:', err.message);
+                if (!res.headersSent) res.status(500).json({ error: 'Failed to process audio', details: err.message });
+                resolve();
+            })
+            .run();
+    }));
 });
 
 // ─── Export / Download ───
-// Download processed files
 router.get('/export/:filename', (req, res) => {
     const filename = req.params.filename;
 
@@ -486,7 +573,7 @@ router.get('/export/:filename', (req, res) => {
 router.use((err, req, res, next) => {
     if (err instanceof multer.MulterError) {
         if (err.code === 'LIMIT_FILE_SIZE') {
-            return res.status(413).json({ error: 'File too large. Max size is 500MB.' });
+            return res.status(413).json({ error: 'File too large. Max size is 50MB.' });
         }
         return res.status(400).json({ error: err.message });
     }
