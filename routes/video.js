@@ -50,21 +50,39 @@ function safeDelete(filePath) {
     } catch (e) { /* ignore */ }
 }
 
-// Memory-optimized FFmpeg output options
+// Memory-optimized FFmpeg output options (tuned for Render 512MB free tier)
 const FFMPEG_OUTPUT_OPTS = [
     '-c:v', 'libx264',
     '-c:a', 'aac',
     '-preset', 'ultrafast',   // minimal RAM usage
-    '-crf', '28',             // lower quality = less memory
+    '-crf', '32',             // higher = smaller output, less memory
     '-threads', '1',          // single thread to cap buffer memory
+    '-maxrate', '800k',       // limit bitrate to reduce memory
+    '-bufsize', '400k',       // small buffer = less RAM
+    '-vf', 'scale=-2:min(ih\,480)', // cap at 480p to slash memory
     '-movflags', '+faststart'
 ];
 
 const FFMPEG_VIDEO_ONLY_OPTS = [
     '-c:v', 'libx264',
     '-preset', 'ultrafast',
-    '-crf', '28',
+    '-crf', '32',
     '-threads', '1',
+    '-maxrate', '800k',
+    '-bufsize', '400k',
+    '-vf', 'scale=-2:min(ih\,480)',
+    '-movflags', '+faststart'
+];
+
+// For operations that already have a -vf (text, filter), use these without the scale filter
+const FFMPEG_NO_SCALE_OPTS = [
+    '-c:v', 'libx264',
+    '-c:a', 'aac',
+    '-preset', 'ultrafast',
+    '-crf', '32',
+    '-threads', '1',
+    '-maxrate', '800k',
+    '-bufsize', '400k',
     '-movflags', '+faststart'
 ];
 
@@ -318,8 +336,8 @@ router.post('/filter', (req, res) => {
 
     enqueueJob(() => new Promise((resolve) => {
         ffmpeg(inputPath)
-            .videoFilters(videoFilter)
-            .outputOptions(FFMPEG_OUTPUT_OPTS)
+            .videoFilters([videoFilter, 'scale=-2:min(ih\,480)'])
+            .outputOptions(FFMPEG_NO_SCALE_OPTS)
             .output(outputPath)
             .on('progress', (progress) => {
                 if (progress.percent) console.log(`  🎨 Filter progress: ${Math.round(progress.percent)}%`);
@@ -388,8 +406,8 @@ router.post('/text', (req, res) => {
 
     enqueueJob(() => new Promise((resolve) => {
         ffmpeg(inputPath)
-            .videoFilters(drawTextFilter)
-            .outputOptions(FFMPEG_OUTPUT_OPTS)
+            .videoFilters([drawTextFilter, 'scale=-2:min(ih\,480)'])
+            .outputOptions(FFMPEG_NO_SCALE_OPTS)
             .output(outputPath)
             .on('progress', (progress) => {
                 if (progress.percent) console.log(`  🔤 Text progress: ${Math.round(progress.percent)}%`);
@@ -446,7 +464,7 @@ router.post('/merge', (req, res) => {
 
         for (let i = 0; i < n; i++) {
             filterParts.push(
-                `[${i}:v]scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30[v${i}]`
+                `[${i}:v]scale=854:480:force_original_aspect_ratio=decrease,pad=854:480:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=24[v${i}]`
             );
             filterParts.push(
                 `[${i}:a]aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo[a${i}]`
