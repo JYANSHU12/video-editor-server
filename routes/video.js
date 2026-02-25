@@ -55,22 +55,24 @@ const FFMPEG_OUTPUT_OPTS = [
     '-c:v', 'libx264',
     '-c:a', 'aac',
     '-preset', 'ultrafast',   // minimal RAM usage
-    '-crf', '32',             // higher = smaller output, less memory
+    '-crf', '35',             // higher = smaller output, less memory
     '-threads', '1',          // single thread to cap buffer memory
-    '-maxrate', '800k',       // limit bitrate to reduce memory
-    '-bufsize', '400k',       // small buffer = less RAM
-    '-vf', 'scale=-2:min(ih\,480)', // cap at 480p to slash memory
-    '-movflags', '+faststart'
+    '-maxrate', '500k',       // limit bitrate to reduce memory
+    '-bufsize', '250k',       // small buffer = less RAM
+    '-vf', 'scale=480:-2',   // 480px wide, auto height
+    '-movflags', '+faststart',
+    '-ac', '1',               // mono audio to save memory
+    '-ar', '22050'            // lower sample rate
 ];
 
 const FFMPEG_VIDEO_ONLY_OPTS = [
     '-c:v', 'libx264',
     '-preset', 'ultrafast',
-    '-crf', '32',
+    '-crf', '35',
     '-threads', '1',
-    '-maxrate', '800k',
-    '-bufsize', '400k',
-    '-vf', 'scale=-2:min(ih\,480)',
+    '-maxrate', '500k',
+    '-bufsize', '250k',
+    '-vf', 'scale=480:-2',
     '-movflags', '+faststart'
 ];
 
@@ -79,11 +81,13 @@ const FFMPEG_NO_SCALE_OPTS = [
     '-c:v', 'libx264',
     '-c:a', 'aac',
     '-preset', 'ultrafast',
-    '-crf', '32',
+    '-crf', '35',
     '-threads', '1',
-    '-maxrate', '800k',
-    '-bufsize', '400k',
-    '-movflags', '+faststart'
+    '-maxrate', '500k',
+    '-bufsize', '250k',
+    '-movflags', '+faststart',
+    '-ac', '1',
+    '-ar', '22050'
 ];
 
 // Multer config — reduced limits for free-tier hosting
@@ -96,7 +100,7 @@ const storage = multer.diskStorage({
 });
 const upload = multer({
     storage,
-    limits: { fileSize: 50 * 1024 * 1024 }, // 50 MB max (was 500 MB)
+    limits: { fileSize: 25 * 1024 * 1024 }, // 25 MB max for Render free tier
     fileFilter: (req, file, cb) => {
         const allowed = /video|audio/;
         if (allowed.test(file.mimetype)) {
@@ -336,7 +340,7 @@ router.post('/filter', (req, res) => {
 
     enqueueJob(() => new Promise((resolve) => {
         ffmpeg(inputPath)
-            .videoFilters([videoFilter, 'scale=-2:min(ih\,480)'])
+            .videoFilters([videoFilter, 'scale=480:-2'])
             .outputOptions(FFMPEG_NO_SCALE_OPTS)
             .output(outputPath)
             .on('progress', (progress) => {
@@ -406,7 +410,7 @@ router.post('/text', (req, res) => {
 
     enqueueJob(() => new Promise((resolve) => {
         ffmpeg(inputPath)
-            .videoFilters([drawTextFilter, 'scale=-2:min(ih\,480)'])
+            .videoFilters([drawTextFilter, 'scale=480:-2'])
             .outputOptions(FFMPEG_NO_SCALE_OPTS)
             .output(outputPath)
             .on('progress', (progress) => {
