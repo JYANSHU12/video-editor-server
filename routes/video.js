@@ -102,7 +102,10 @@ function getSystemFont() {
         'C:/Windows/Fonts/tahoma.ttf',
     ];
     for (const f of candidates) {
-        if (fs.existsSync(f)) return f.replace(/\\/g, '/').replace(/:/g, '\\\\:');
+        if (fs.existsSync(f)) {
+            // Escape path for ffmpeg drawtext: forward slashes, escape colons and backslashes
+            return f.replace(/\\/g, '/').replace(/:/g, '\\:');
+        }
     }
     return null;
 }
@@ -236,18 +239,32 @@ router.post('/trim', (req, res) => {
         return res.status(404).json({ error: 'Input file not found' });
     }
 
-    console.log(`✂️ Trimming: ${filename} from ${startTime}s to ${endTime}s`);
+    const start = parseFloat(startTime) || 0;
+    const end = parseFloat(endTime) || 0;
+    const duration = end > start ? end - start : 0;
+
+    console.log(`✂️ Trimming: ${filename} from ${start}s to ${end}s (duration: ${duration}s)`);
 
     enqueueJob(() => new Promise((resolve, reject) => {
         const cmd = ffmpeg(inputPath)
-            .setStartTime(startTime || 0)
-            .outputOptions(FFMPEG_OUTPUT_OPTS);
+            .inputOptions(['-ss', String(start)]);
 
-        if (endTime) {
-            cmd.setDuration(endTime - (startTime || 0));
+        // Use -t as output option (not input) for reliable duration limiting
+        const outOpts = [...FFMPEG_OUTPUT_OPTS];
+        if (duration > 0) {
+            outOpts.push('-t', String(duration));
         }
 
-        cmd.output(outputPath)
+        cmd.outputOptions(outOpts)
+            .output(outputPath)
+            .on('start', (commandLine) => {
+                console.log('  ✂️ FFmpeg command:', commandLine);
+            })
+            .on('stderr', (stderrLine) => {
+                if (stderrLine.includes('Error') || stderrLine.includes('error') || stderrLine.includes('Invalid') || stderrLine.includes('failed')) {
+                    console.error('  ✂️ FFmpeg stderr:', stderrLine);
+                }
+            })
             .on('progress', (progress) => {
                 if (progress.percent) console.log(`  ✂️ Trim progress: ${Math.round(progress.percent)}%`);
             })
@@ -256,8 +273,9 @@ router.post('/trim', (req, res) => {
                 res.json({ success: true, filename: outputFilename, message: 'Video trimmed successfully' });
                 resolve();
             })
-            .on('error', (err) => {
+            .on('error', (err, stdout, stderr) => {
                 console.error('Trim error:', err.message);
+                console.error('Trim stderr:', stderr);
                 if (!res.headersSent) res.status(500).json({ error: 'Failed to trim video', details: err.message });
                 resolve(); // resolve even on FFmpeg error so queue continues
             })
@@ -290,7 +308,7 @@ router.post('/filter', (req, res) => {
         vintage: 'curves=vintage',
         negative: 'negate',
         mirror: 'hflip',
-        emboss: 'convolution=-2 -1 0 -1 1 1 0 1 2:-2 -1 0 -1 1 1 0 1 2:-2 -1 0 -1 1 1 0 1 2:-2 -1 0 -1 1 1 0 1 2'
+        emboss: 'convolution=-2 -1 0 -1 1 1 0 1 2:-2 -1 0 -1 1 1 0 1 2:-2 -1 0 -1 1 1 0 1 2:-2 -1 0 -1 1 1 0 1 2:5:5:5:5:0:128'
     };
 
     const videoFilter = filterMap[filter];
@@ -334,30 +352,39 @@ router.post('/text', (req, res) => {
     }
 
     const size = fontSize || 32;
-    const color = (fontColor || 'white').replace('#', '0x');
+    // Convert #ffffff to 0xffffff for ffmpeg drawtext, or use color name
+    let color = fontColor || 'white';
+    if (color.startsWith('#')) {
+        color = '0x' + color.slice(1);
+    }
     const posX = x || '(w-text_w)/2';
     const posY = y || '(h-text_h)/2';
 
-    // Escape special chars for drawtext filter
+    // Escape special chars for drawtext filter (minimal escaping)
     const escapedText = text
-        .replace(/\\/g, '\\\\\\\\')
-        .replace(/'/g, "'\\\\\\''")
-        .replace(/:/g, '\\:')
-        .replace(/;/g, '\\;');
+        .replace(/\\/g, '\\\\')      // escape backslashes
+        .replace(/'/g, "\u2019")       // replace single quotes with unicode right single quote
+        .replace(/:/g, '\\:')         // escape colons
+        .replace(/%/g, '%%')           // escape percent signs
+        .replace(/\[/g, '\\[')        // escape brackets
+        .replace(/\]/g, '\\]');
 
     // Build drawtext filter - fontfile is required on Windows
     const fontFile = getSystemFont();
-    let drawTextFilter = `drawtext=text='${escapedText}':fontsize=${size}:fontcolor=${color}:x=${posX}:y=${posY}`;
+    let drawTextFilter;
 
     if (fontFile) {
         drawTextFilter = `drawtext=fontfile='${fontFile}':text='${escapedText}':fontsize=${size}:fontcolor=${color}:x=${posX}:y=${posY}`;
+    } else {
+        drawTextFilter = `drawtext=text='${escapedText}':fontsize=${size}:fontcolor=${color}:x=${posX}:y=${posY}`;
     }
 
     if (startTime !== undefined && endTime !== undefined) {
         drawTextFilter += `:enable='between(t,${startTime},${endTime})'`;
     }
 
-    console.log(`🔤 Adding text '${text}' to: ${filename}`);
+    console.log(`🔤 Adding text to: ${filename}`);
+    console.log(`🔤 Filter: ${drawTextFilter}`);
 
     enqueueJob(() => new Promise((resolve) => {
         ffmpeg(inputPath)
@@ -398,36 +425,62 @@ router.post('/merge', (req, res) => {
 
     const outputFilename = `merged_${uuidv4()}.mp4`;
     const outputPath = path.join(PROCESSED_DIR, outputFilename);
-    const listFilePath = path.join(PROCESSED_DIR, `list_${uuidv4()}.txt`);
 
-    // Create concat file list
-    const fileList = filenames.map(f => {
-        const fullPath = path.join(UPLOADS_DIR, f).replace(/\\/g, '/');
-        return `file '${fullPath}'`;
-    }).join('\n');
-
-    fs.writeFileSync(listFilePath, fileList);
-
-    console.log(`🔗 Merging ${filenames.length} videos`);
+    console.log(`🔗 Merging ${filenames.length} videos using concat filter`);
 
     enqueueJob(() => new Promise((resolve) => {
-        ffmpeg()
-            .input(listFilePath)
-            .inputOptions(['-f', 'concat', '-safe', '0'])
-            .outputOptions(FFMPEG_OUTPUT_OPTS)
+        const cmd = ffmpeg();
+
+        // Add each input file
+        filenames.forEach(f => {
+            cmd.input(path.join(UPLOADS_DIR, f));
+        });
+
+        // Build the complex filter:
+        // 1. Scale + pad each input to 1280x720 with same pixel format
+        // 2. Normalize audio to stereo 44100Hz
+        // 3. Concat all streams
+        const n = filenames.length;
+        let filterParts = [];
+        let concatInputs = '';
+
+        for (let i = 0; i < n; i++) {
+            filterParts.push(
+                `[${i}:v]scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30[v${i}]`
+            );
+            filterParts.push(
+                `[${i}:a]aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo[a${i}]`
+            );
+            concatInputs += `[v${i}][a${i}]`;
+        }
+
+        filterParts.push(
+            `${concatInputs}concat=n=${n}:v=1:a=1[outv][outa]`
+        );
+
+        const complexFilter = filterParts.join(';');
+
+        cmd.complexFilter(complexFilter, ['outv', 'outa'])
+            .outputOptions([
+                '-c:v', 'libx264',
+                '-c:a', 'aac',
+                '-preset', 'ultrafast',
+                '-crf', '28',
+                '-threads', '1',
+                '-movflags', '+faststart',
+                '-shortest'
+            ])
             .output(outputPath)
             .on('progress', (progress) => {
                 if (progress.percent) console.log(`  🔗 Merge progress: ${Math.round(progress.percent)}%`);
             })
             .on('end', () => {
-                safeDelete(listFilePath);
                 console.log(`  🔗 Merge complete: ${outputFilename}`);
                 res.json({ success: true, filename: outputFilename, message: 'Videos merged successfully' });
                 resolve();
             })
             .on('error', (err) => {
                 console.error('Merge error:', err.message);
-                safeDelete(listFilePath);
                 if (!res.headersSent) res.status(500).json({ error: 'Failed to merge videos', details: err.message });
                 resolve();
             })
@@ -488,7 +541,7 @@ router.post('/audio', (req, res) => {
             enqueueJob(() => new Promise((resolve) => {
                 ffmpeg(inputPath)
                     .audioFilters(`afade=t=out:st=${fadeStart}:d=3`)
-                    .outputOptions(FFMPEG_VIDEO_ONLY_OPTS)
+                    .outputOptions(FFMPEG_OUTPUT_OPTS)
                     .output(outputPath)
                     .on('progress', (progress) => {
                         if (progress.percent) console.log(`  📉 FadeOut progress: ${Math.round(progress.percent)}%`);
@@ -513,10 +566,13 @@ router.post('/audio', (req, res) => {
     const outputFilename = `audio_${uuidv4()}.mp4`;
     const outputPath = path.join(PROCESSED_DIR, outputFilename);
     let cmd = ffmpeg(inputPath);
+    // Use the right output options: mute needs no audio codec, all others need it
+    let useOutputOpts = FFMPEG_OUTPUT_OPTS;
 
     switch (operation) {
         case 'mute':
             cmd.noAudio();
+            useOutputOpts = FFMPEG_VIDEO_ONLY_OPTS; // no audio codec needed for mute
             break;
         case 'volume':
             cmd.audioFilters(`volume=${volume || 1.0}`);
@@ -529,7 +585,7 @@ router.post('/audio', (req, res) => {
     }
 
     enqueueJob(() => new Promise((resolve) => {
-        cmd.outputOptions(FFMPEG_VIDEO_ONLY_OPTS)
+        cmd.outputOptions(useOutputOpts)
             .output(outputPath)
             .on('progress', (progress) => {
                 if (progress.percent) console.log(`  🔊 Audio progress: ${Math.round(progress.percent)}%`);
